@@ -284,7 +284,7 @@ def stack_typed_nbrs_per_bead(typed_nbr_fn, real_pos_PN3, box, n_bead):
     return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *per_bead)
 
 
-def get_type_mask_fns(type_count):
+def get_type_mask_fns(type_count, K=None):
     '''
         Returned type_mask_fns filter nbrs.idx by atom type.
         Padded ghost atoms are excluded.
@@ -292,15 +292,16 @@ def get_type_mask_fns(type_count):
         and can also be added as a custom_mask_function in jax_md.neighbor_list.
     '''
     type_mask_fns = []
-    K = jax.device_count()
-    full_mask = get_mask_by_device(type_count)
+    K = jax.device_count() if K is None else K
+    full_mask = get_mask_by_device(type_count, K)
     type_count_each = -(-np.array(type_count)//K)        # type_count for each device after padding
     type_idx_each = np.cumsum([0] + list(type_count_each)) # type_idx for each device after padding
     N_each = type_idx_each[-1] # number of atoms for each device after padding
     for i in range(len(type_count)):
         # filter neighbor atoms by type i; idx = nbrs.idx returned by jax_md
         def mask_fn(idx, i=i):
-            idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
+            if K > 1:
+                idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
             valid_center_atom = full_mask[:,None]
             valid_type_neighbor_atom = idx%N_each >= type_idx_each[i]
             valid_type_neighbor_atom *= idx%N_each < type_idx_each[i+1]
@@ -312,14 +313,16 @@ def get_type_mask_fns(type_count):
     return type_mask_fns
 
 
-def get_idx_mask_fn(type_count):
+def get_idx_mask_fn(type_count, K=None):
     '''
         Returned idx_mask_fn that filters out ghost atoms from nbrs.idx.
     '''
-    full_mask = get_mask_by_device(type_count)
+    K = jax.device_count() if K is None else K
+    full_mask = get_mask_by_device(type_count, K)
     idx_mask_out = np.arange(len(full_mask))[~np.array(full_mask)]
     def idx_mask_fn(idx):
-        idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
+        if K > 1:
+            idx = jax.lax.with_sharding_constraint(idx, PSpec('atom'))
         filter = full_mask[:,None] * jnp.isin(idx, idx_mask_out, invert=True)
         return jnp.where(filter, idx, len(full_mask))
     return idx_mask_fn
@@ -350,16 +353,18 @@ class typed_neighbor_list_fn():
     update: Callable = jax_md.dataclasses.static_field()
 
 
-def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
+def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2, K=None):
     '''
         Returns a typed neighbor list function that can be used to allocate and update neighbor lists.
         allocate_fn() and update_fn() accept real space coordinates but processes internally in fractional coordinates.
+        K is the number of device partitions (default jax.device_count()); K=1 keeps each list on one device.
     '''
+    K = jax.device_count() if K is None else K
     type_idx = np.array(type_idx, dtype=int)
     type_count = tuple(type_count)
     reference_box = box.astype(jnp.float32) # box at creation of typed_neighbor_list_fn; pass only this box to jax_md.neighbor_list
-    type_mask_fns = get_type_mask_fns(type_count)
-    idx_mask_fn = get_idx_mask_fn(type_count)
+    type_mask_fns = get_type_mask_fns(type_count, K)
+    idx_mask_fn = get_idx_mask_fn(type_count, K)
 
     def canonicalize(coord, box=reference_box):
         # scale coord to reference_box and store in float32 fractional coordinates
@@ -369,7 +374,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         # shrink by 1e-7 from the boundary to avoid numerical issues
         coord = coord * (1-5e-7)
         # sort by type, pad each type, and partition to multiple devices
-        coord = reorder_by_device(coord, type_idx)
+        coord = reorder_by_device(coord, type_idx, K=K)
         return coord
 
     # allocate function: non-jit-compatible
@@ -436,8 +441,7 @@ def typed_neighbor_list(box, type_idx, type_count, rcut, buffer_ratio=1.2):
         '''
 
         # ensure idx is sharded by device
-        K = jax.device_count()
-        nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, PSpec('atom'))
+        nbr_idx = jax.lax.with_sharding_constraint(nbrs.idx, PSpec('atom')) if K > 1 else nbrs.idx
         # take knbr[i] smallest indices for type i
         nbrs_idx = [-jax.lax.top_k(-fn(nbr_idx), k)[0]
                     for fn,k in zip(type_mask_fns, knbr)]

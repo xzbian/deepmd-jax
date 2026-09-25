@@ -91,6 +91,7 @@ class Simulation:
                  type_symbols: Optional[List[str]] = None,
                  pimd_lambda=1.0,
                  pimd_print_invariant=False,
+                 pimd_device_sharding='bead',
                 ):
         '''
             Initialize a Simulation instance.
@@ -125,6 +126,7 @@ class Simulation:
             n_bead: number of ring-polymer beads. 1 (default) = classical MD. n_bead > 1 switches routine='NVT' to path-integral MD using PILE-L thermostat (internal modes critically damped, centroid friction = 1/tau_t). initial_position may be (N,3) (replicated across beads) or (P,N,3).
             pimd_lambda: PILE internal-mode damping scale for PIMD, where gamma_k = 2 * pimd_lambda * omega_k for non-centroid modes. The centroid friction remains 1/tau_t. Default 1.0 preserves standard PILE behavior.
             pimd_print_invariant: if True, include the PIMD invariant reporter. Disabled by default because the finite-step diagnostic can drift more visibly as n_bead increases.
+            pimd_device_sharding: multi-device PIMD decomposition. 'bead' (default) evaluates whole beads on separate devices (bead count padded to a multiple of the device count); 'atom' splits the atoms of every bead over devices, which can become unstable with DPLR models.
             ############################
             Usage:
                 sim = Simulation(...)
@@ -139,6 +141,12 @@ class Simulation:
         self._pimd_print_invariant = bool(pimd_print_invariant)
         if self._pimd_lambda < 0:
             raise ValueError("pimd_lambda must be non-negative.")
+        if pimd_device_sharding not in ('atom', 'bead'):
+            raise ValueError("pimd_device_sharding must be 'atom' or 'bead'.")
+        # Number of device partitions of one configuration: 1 when whole beads are placed on devices.
+        self._pimd_shard_beads = self._is_pimd and pimd_device_sharding == 'bead' and jax.device_count() > 1
+        self._device_partitions = 1 if self._pimd_shard_beads else jax.device_count()
+        self._padded_n_bead = -(-self._n_bead // jax.device_count()) * jax.device_count()
         if self._is_pimd:
             if routine not in ('NVT', 'NPT'):
                 raise NotImplementedError(
@@ -258,11 +266,15 @@ class Simulation:
         if self._is_pimd:
             init_info.append(f"n_beads={self._n_bead}")
             init_info.append(f"pimd_lambda={self._pimd_lambda:g}")
+            if jax.device_count() > 1:
+                init_info.append(f"device_sharding={'bead' if self._pimd_shard_beads else 'atom'}")
         suffix = f" ({', '.join(init_info)})" if init_info else ""
         run_label, method_label = _routine_run_label(self._routine, self._is_pimd)
         print(f"# Initialized {run_label} ({method_label}) with {self._natoms} atoms{suffix}")
         if self._is_pimd and self._pimd_print_invariant:
             print("# Warning: PIMD invariant is a finite-step diagnostic and may drift more visibly as n_beads increases.")
+        if self._is_pimd and jax.device_count() > 1 and not self._pimd_shard_beads and self._model.params['type'] == 'dplr':
+            print("# Warning: atom-sharded multi-device PIMD with a DPLR model can become unstable; use pimd_device_sharding='bead'.")
 
         # Initialize neighbor list if needed
         if self._static_args['use_neighbor_list']:
@@ -431,15 +443,22 @@ class Simulation:
             # perturbation = 1, required by jax-md pressure calculation
             coord = coord * perturbation
             box = box * perturbation
-            coord = jax.lax.with_sharding_constraint(coord, PSpec())
+            if not self._pimd_shard_beads:
+                coord = jax.lax.with_sharding_constraint(coord, PSpec())
             box = jax.lax.with_sharding_constraint(box, PSpec())
 
             if not self._is_pimd:
                 return _single_conf_energy(coord, box, nbrs_nm)
             else:
+                if self._pimd_shard_beads:
+                    # pad beads to a multiple of the device count and shard them over the device mesh axis
+                    def shard_beads(x):
+                        x = jnp.concatenate([x, jnp.repeat(x[-1:], self._padded_n_bead - self._n_bead, axis=0)])
+                        return jax.lax.with_sharding_constraint(x, PSpec('atom', *([None] * (x.ndim - 1))))
+                    coord, nbrs_nm = shard_beads(coord), jax.tree.map(shard_beads, nbrs_nm)
                 nbrs_axes = None if nbrs_nm is None else 0
                 E_per_bead = jax.vmap(_single_conf_energy, in_axes=(0, None, nbrs_axes))(coord, box, nbrs_nm) # (P,)
-                return jnp.sum(E_per_bead) / self._n_bead # average over beads
+                return jnp.sum(E_per_bead[:self._n_bead]) / self._n_bead # average over beads
 
         return energy_fn
 
@@ -461,7 +480,8 @@ class Simulation:
         '''
         use_neighbor_list *= self._check_if_use_neighbor_list()
         if use_neighbor_list:
-            static_args = nn.FrozenDict({'type_idx':tuple(self._type_idx), 'use_neighbor_list':True})
+            static_args = nn.FrozenDict({'type_idx':tuple(self._type_idx), 'use_neighbor_list':True,
+                                         'device_partitions':self._device_partitions})
             return static_args
         else:
             # For npt, include extra buffer for lattice selection !! not implemented yet
@@ -604,7 +624,8 @@ class Simulation:
                                                  self._type_idx,
                                                  self._type_count,
                                                  self._model.params['rcut'] + self._neighbor_skin,
-                                                 self._neighbor_buffer_ratio)
+                                                 self._neighbor_buffer_ratio,
+                                                 K=self._device_partitions)
         pos = self._state.position if position is None else position
         if self._is_pimd:
             self._typed_nbrs = stack_typed_nbrs_per_bead(
@@ -701,7 +722,7 @@ class Simulation:
         def _drift_per_bead(typed_nbrs_single, position_N3, box):
             scale = typed_nbrs_single.reference_box / box
             scaled_position = (position_N3 % box) * scale
-            scaled_position = reorder_by_device(scaled_position, self._type_idx)
+            scaled_position = reorder_by_device(scaled_position, self._type_idx, K=self._device_partitions)
             return norm_ortho_box(
                 scaled_position - typed_nbrs_single.reference_position,
                 typed_nbrs_single.reference_box,

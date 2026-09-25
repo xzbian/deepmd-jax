@@ -428,12 +428,13 @@ def atomic_inverse_perm(type_idx, nsel):
         [np.where(type_idx == t)[0] for t in nsel])
     return np.argsort(sorted_nsel, kind='stable')
 
-def get_mask_by_device(type_count):
+def get_mask_by_device(type_count, K=None):
     '''
         For multiple-device partitioning, ghost atoms are padded.
         Returns a binary mask indicating the valid atoms, sharded by device.
+        K defaults to jax.device_count(); K=1 gives an unpartitioned mask.
     '''
-    K = jax.device_count()
+    K = jax.device_count() if K is None else K
     mask = concat([
                 concat([jnp.ones(count, dtype=bool),
                         jnp.zeros((-count%K,), dtype=bool)
@@ -442,4 +443,4 @@ def get_mask_by_device(type_count):
                 ],
             axis=1).reshape(-1)
     # ensure mask is sharded by device
-    return jax.lax.with_sharding_constraint(mask, PSpec('atom'))
+    return jax.lax.with_sharding_constraint(mask, PSpec('atom')) if K > 1 else mask

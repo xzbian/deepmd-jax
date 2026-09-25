@@ -17,12 +17,12 @@ class DPModel(nn.Module):
             nsel = [list(valid_types).index(i) for i in self.params['nsel']]
         else:
             nsel = list(range(len(type_count)))
-        K = 1 if static_args.get('use_neighborlist', False) else (jax.device_count() if nbrs_nm is not None else 1)
+        K = 1 if static_args.get('use_neighborlist', False) else (static_args.get('device_partitions', jax.device_count()) if nbrs_nm is not None else 1)
         coord = reorder_by_device(coord, type_idx, K=K)
         if nbrs_nm is not None:
             nbrs_nm = [[nbrs_nm[i][j] for j in valid_types] for i in valid_types]
             type_count_new = [-(-type_count[i]//K) for i in range(len(type_count))]
-            mask = jnp.ones_like(coord[:,0]) if K == 1 else get_mask_by_device(type_count)
+            mask = jnp.ones_like(coord[:,0]) if K == 1 else get_mask_by_device(type_count, K)
             return coord, type_count_new, mask, compress, K, nsel, nbrs_nm
         else:
             return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
