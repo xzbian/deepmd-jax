@@ -255,6 +255,27 @@ def get_atomic_stats(dataset, atomic_sel):
     return Ebias, np.where(out_norm > 0, out_norm, 1.).astype(np.float32)
 
 
+def fit_energy_shift(dataset, energy_fn, valid_types, n_frames):
+    '''
+        Per-type energy shift that moves a model's predictions onto the energy reference of
+        the dataset. Two levels of theory can differ by a constant energy per atom of each
+        type (where zero energy is), which forces do not see. Like fit_energy, but fit to the
+        mean (label - prediction) of each subset, on up to n_frames random frames, against
+        its type counts. When all subsets share one composition, only the total shift is
+        determined and the per-type split is the minimum-norm one.
+        energy_fn(coord, box, type_idx, lattice_args) predicts the energy of one frame.
+    '''
+    valid_types = np.asarray(valid_types)
+    type_count, residual = [], []
+    for leaf in dataset.get_leaves():
+        frames = np.random.choice(leaf.nframes, min(n_frames, leaf.nframes), replace=False)
+        pred = np.array([energy_fn(leaf.data['coord'][i], leaf.data['box'][i],
+                                   tuple(leaf.type_idx), leaf.lattice_args) for i in frames])
+        residual.append(np.mean(leaf.data['energy'].reshape(-1)[frames] - pred))
+        type_count.append(np.bincount(leaf.type_idx, minlength=valid_types.max() + 1)[valid_types])
+    return np.linalg.lstsq(np.array(type_count, dtype=float), np.array(residual), rcond=1e-3)[0]
+
+
 class DatasetGroup:
     """
     Composite dataset made from multiple subset datasets.

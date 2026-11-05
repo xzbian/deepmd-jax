@@ -6,7 +6,7 @@ import time, datetime
 import flax.linen as nn
 from functools import partial
 from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges, get_max_nbrs, neighborlist_is_efficient, assert_type_idx_in_valid_types
-from .data import Dataset, compute_lattice_candidate, get_atomic_stats
+from .data import Dataset, compute_lattice_candidate, get_atomic_stats, fit_energy_shift
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
@@ -67,6 +67,7 @@ def train(
     use_neighbor_list_when_possible: bool = True,
     init_model_path: str = None,
     fitting_only: bool = False,
+    refit_energy_bias: bool = True,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -118,6 +119,7 @@ def train(
             use_neighbor_list_when_possible: use a simple training neighborlist when the lattice candidate count is one.
             init_model_path: initialize from a saved model, retaining its architecture, type mapping, statistics, and biases; architecture arguments are ignored. Starts a new optimizer.
             fitting_only: train only fitting networks; requires init_model_path. Otherwise all network parameters are trained.
+            refit_energy_bias: refit the per-type energy bias to the training data before fine-tuning.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -368,6 +370,18 @@ def train(
     else:
         model = DPModel(dict(params, is_compressed=False, hybrid=hybrid, atomic_data_prefix=atomic_data_prefix))
         variables = {'params': variables['params']}
+        if refit_energy_bias and model_type in ('energy', 'dplr'):
+            energy_fn = jax.jit(model.energy, static_argnames=('static_args',))
+            shift = fit_energy_shift(train_data,
+                                     lambda coord, box, type_idx, lattice_args: energy_fn(
+                                         variables, coord, box, _get_static_args(type_idx, lattice_args)),
+                                     params['valid_types'], getstat_bs)
+            names = params.get('chemical_types')
+            print('# Energy bias refit to the training data, shift per atom (eV):',
+                  {(names[t] if names else int(t)): round(float(s), 6)
+                   for t, s in zip(params['valid_types'], shift)})
+            model = DPModel(dict(model.params, Ebias=(np.asarray(params['Ebias'], dtype=np.float64)
+                                                      + shift).astype(np.float32)))
         print('# Training %s.' % ('fitting networks only' if fitting_only else 'all network parameters'))
     print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
     print('# Model initialized with parameter count %d.' %
